@@ -1,0 +1,90 @@
+# Builds an unsigned BitChord IPA for sideloading. Run it by hand:
+# Actions tab -> "Build IPA" -> Run workflow. The IPA is the "BitChord-ipa" artifact on the finished run.
+# The whole app source is the one file BitChord.zip in this repo; this workflow unpacks and builds it.
+name: Build IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label (xcode-27, or macos-26 if that one is not available to you)"
+        default: xcode-27
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  ipa:
+    name: Build unsigned IPA
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select newest Xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$XCODE" ] || XCODE=/Applications/Xcode.app
+          echo "DEVELOPER_DIR=$XCODE/Contents/Developer" >> "$GITHUB_ENV"
+          echo "Using $XCODE"
+          xcodebuild -version
+
+      - name: Unpack source
+        run: unzip -q BitChord.zip -d src
+
+      - name: Resolve packages (retries; GitHub clones fail sometimes)
+        run: |
+          cd src/BitChord-iOS-main
+          git config --global http.postBuffer 524288000
+          git config --global http.version HTTP/1.1
+          for i in 1 2 3 4 5; do
+            xcodebuild -resolvePackageDependencies -workspace BitChord.xcworkspace -scheme BitChord \
+              -derivedDataPath .derived-release && exit 0
+            echo "attempt $i failed, retrying"; sleep 20
+          done
+          exit 1
+
+      - name: Build IPA
+        env:
+          JOBS: "4"
+        run: |
+          cd src/BitChord-iOS-main
+          chmod +x scripts/*.sh
+          set +e
+          scripts/make-ipa.sh 2>&1 | tee build.log
+          status=${PIPESTATUS[0]}
+          echo
+          echo "================ ERRORS (copy from here) ================"
+          grep -E "error:|Error:|Stack dump|fatal error|Segmentation|Assertion" build.log | grep -v "Process completed" | sort -u | cut -c1-400 | head -80
+          echo "================ END ERRORS ================"
+          exit $status
+
+      - name: Diagnose (only if the build failed)
+        if: failure()
+        run: |
+          cd src/BitChord-iOS-main
+          set +e
+          xcodebuild build -workspace BitChord.xcworkspace -scheme GagaUI -configuration Debug \
+            -destination 'generic/platform=iOS' -derivedDataPath .derived-debug \
+            CODE_SIGNING_ALLOWED=NO > diag.log 2>&1
+          echo "================ DIAGNOSE ERRORS ================"
+          grep -E "error:|Stack dump|fatal error" diag.log | grep -v DVTAssertions | sort -u | cut -c1-500 | head -80
+          echo "================ END DIAGNOSE ================"
+          tail -5 diag.log
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: src/BitChord-iOS-main/build.log
+          if-no-files-found: ignore
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: BitChord-ipa
+          path: src/BitChord-iOS-main/build/*.ipa
+          if-no-files-found: error
+          retention-days: 30
